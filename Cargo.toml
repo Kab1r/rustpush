@@ -8,9 +8,19 @@ default-run = "rustpush-test"
 
 [dependencies]
 lazy_static = "1.4.0"
+# unicorn = { path = "./unicorn/bindings/rust", version = "1" }
+unicorn-engine = { version = "2", features = ["dynamic_linkage"] }
+mach_object = "0.1"
+clap = "4"
 plist = "1.5.0"
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.11", features = ["json", "rustls-tls", "gzip", "stream"] }
+reqwest = { version = "0.11", features = [
+    "json",
+    "rustls-tls",
+    "gzip",
+    "stream",
+] }
+pyo3 = { version = "0.20", features = ["auto-initialize"] }
 serde = { version = "1.0", features = ["derive"] }
 openssl = { version = "0.10.56", features = ["vendored"] }
 uuid = { version = "1.4.1", features = ["v4"] }
@@ -38,6 +48,10 @@ prost-build = { version = "0.12.0" }
 [[bin]]
 name = "rustpush-test"
 path = "src/test.rs"
+
+[[bin]]
+name = "demo"
+path = "src/demo.rs"
 
 [lib]
 name = "rustpush"

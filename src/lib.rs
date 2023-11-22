@@ -1,23 +1,30 @@
-mod bags;
 mod albert;
 mod apns;
+mod bags;
+pub mod emulated;
+mod error;
 mod ids;
-mod util;
 mod imessage;
 mod mmcs;
-mod error;
+mod util;
 
 pub mod mmcsp {
     include!(concat!(env!("OUT_DIR"), "/mmcsp.rs"));
 }
 
-pub use apns::{APNSState, APNSConnection};
-pub use ids::{user::{IDSUser, IDSAppleUser, IDSPhoneUser}, identity::register};
-pub use imessage::messages::{IMessage, BalloonBody, ConversationData, Message, Attachment, NormalMessage, RenameMessage, IconChangeMessage, MessageParts, MessagePart, MMCSFile, IndexedMessagePart};
-pub use imessage::client::{IMClient, RecievedMessage};
+pub use apns::{APNSConnection, APNSState};
 pub use error::PushError;
-extern crate pretty_env_logger;
+pub use ids::{
+    identity::register,
+    user::{IDSAppleUser, IDSPhoneUser, IDSUser},
+};
+pub use imessage::client::{IMClient, RecievedMessage};
+pub use imessage::messages::{
+    Attachment, BalloonBody, ConversationData, IMessage, IconChangeMessage, IndexedMessagePart,
+    MMCSFile, Message, MessagePart, MessageParts, NormalMessage, RenameMessage,
+};
 extern crate log;
+extern crate pretty_env_logger;
 
 //not sure if this can be called outside of this library and still have it work
 pub fn init_logger() {
