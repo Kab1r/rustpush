@@ -5,7 +5,7 @@ mod error;
 mod ids;
 mod imessage;
 mod mmcs;
-mod util;
+pub mod util;
 
 pub mod mmcsp {
     include!(concat!(env!("OUT_DIR"), "/mmcsp.rs"));
