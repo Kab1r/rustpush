@@ -1,16 +1,26 @@
-
 use std::io::Cursor;
 
 use log::info;
-use openssl::{rsa::{Rsa, Padding}, x509::{X509ReqBuilder, X509NameBuilder}, error::ErrorStack, nid::Nid, bn::BigNum, hash::MessageDigest, pkey::{PKey, PKeyRef, Private}, sign::Signer};
+use openssl::{
+    bn::BigNum,
+    error::ErrorStack,
+    hash::MessageDigest,
+    nid::Nid,
+    pkey::{PKey, PKeyRef, Private},
+    rsa::{Padding, Rsa},
+    sign::Signer,
+    x509::{X509NameBuilder, X509ReqBuilder},
+};
 use plist::Data;
 use uuid::Uuid;
 
-use serde::Serialize;
 use regex::Regex;
+use serde::Serialize;
 
-use crate::{util::{plist_to_string, plist_to_buf, KeyPair, get_nested_value, make_reqwest}, PushError};
-
+use crate::{
+    util::{get_nested_value, make_reqwest, plist_to_buf, plist_to_string, KeyPair},
+    PushError,
+};
 
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
@@ -23,7 +33,7 @@ struct ActivationInfo {
     product_type: String,
     product_version: String,
     serial_number: String,
-    unique_device_id: String
+    unique_device_id: String,
 }
 
 #[derive(Serialize)]
@@ -33,7 +43,7 @@ struct ActivationRequest {
     #[serde(rename = "ActivationInfoXML")]
     activation_info_xml: Data,
     fair_play_cert_chain: Data,
-    fair_play_signature: Data
+    fair_play_signature: Data,
 }
 
 fn build_activation_info(private_key: &PKeyRef<Private>) -> Result<ActivationInfo, ErrorStack> {
@@ -61,23 +71,31 @@ fn build_activation_info(private_key: &PKeyRef<Private>) -> Result<ActivationInf
         product_type: "windows1,1".to_string(),
         product_version: "10.6.4".to_string(),
         serial_number: "WindowSerial".to_string(),
-        unique_device_id: Uuid::new_v4().to_string()
+        unique_device_id: Uuid::new_v4().to_string(),
     })
 }
 
 // Generates an APNs push certificate by talking to Albert
 // Returns (private key PEM, certificate PEM) (actual data buffers)
 pub async fn generate_push_cert() -> Result<KeyPair, PushError> {
-    let private_key = PKey::from_rsa(Rsa::generate_with_e(2048, BigNum::from_u32(65537)?.as_ref())?)?;
+    let private_key = PKey::from_rsa(Rsa::generate_with_e(
+        2048,
+        BigNum::from_u32(65537)?.as_ref(),
+    )?)?;
     let activation_info = build_activation_info(private_key.as_ref())?;
 
-    info!("Generated activation info (with UUID: {})", &activation_info.unique_device_id);
-    
+    info!(
+        "Generated activation info (with UUID: {})",
+        &activation_info.unique_device_id
+    );
+
     let activation_info_plist = plist_to_buf(&activation_info)?;
 
     // load fairplay key
-    let fairplay_key = PKey::from_rsa(Rsa::private_key_from_pem(include_bytes!("../certs/fairplay.pem"))?)?;
-    
+    let fairplay_key = PKey::from_rsa(Rsa::private_key_from_pem(include_bytes!(
+        "../certs/fairplay.pem"
+    ))?)?;
+
     // sign activation info
     let mut signer = Signer::new(MessageDigest::sha1(), fairplay_key.as_ref())?;
     signer.set_rsa_padding(Padding::PKCS1)?;
@@ -87,27 +105,48 @@ pub async fn generate_push_cert() -> Result<KeyPair, PushError> {
         activation_info_complete: true,
         activation_info_xml: activation_info_plist.into(),
         fair_play_cert_chain: include_bytes!("../certs/fairplay.cert").to_vec().into(),
-        fair_play_signature: signature.into()
+        fair_play_signature: signature.into(),
     };
 
     // activate with apple
     let client = make_reqwest();
     let form = [("activation-info", plist_to_string(&request)?)];
-    let resp = client.post("https://albert.apple.com/WebObjects/ALUnbrick.woa/wa/deviceActivation?device=Windows")
-            .form(&form)
-            .send()
-            .await?;
+    let resp = client
+        .post(
+            "https://albert.apple.com/WebObjects/ALUnbrick.woa/wa/deviceActivation?device=Windows",
+        )
+        .form(&form)
+        .send()
+        .await?;
     let text = resp.text().await?;
 
     // parse protocol from HTML
-    let protocol_raw = Regex::new(r"<Protocol>(.*)</Protocol>").unwrap()
-            .captures(&text).ok_or(PushError::AlbertCertParseError)?.get(1).unwrap();
-    
+    let protocol_raw = Regex::new(r"<Protocol>(.*)</Protocol>")
+        .unwrap()
+        .captures(&text)
+        .ok_or(PushError::AlbertCertParseError)?
+        .get(1)
+        .unwrap();
+
     let protocol = plist::Value::from_reader(Cursor::new(protocol_raw.as_str()))?;
-    let certificate = get_nested_value(&protocol, &["device-activation", "activation-record", "DeviceCertificate"]).unwrap().as_data().unwrap();
+    let certificate = get_nested_value(
+        &protocol,
+        &[
+            "device-activation",
+            "activation-record",
+            "DeviceCertificate",
+        ],
+    )
+    .unwrap()
+    .as_data()
+    .unwrap();
 
     Ok(KeyPair {
         private: private_key.rsa().unwrap().private_key_to_der()?,
-        cert: rustls_pemfile::certs(&mut Cursor::new(certificate.to_vec())).unwrap().into_iter().nth(0).unwrap()
+        cert: rustls_pemfile::certs(&mut Cursor::new(certificate.to_vec()))
+            .unwrap()
+            .into_iter()
+            .nth(0)
+            .unwrap(),
     })
 }

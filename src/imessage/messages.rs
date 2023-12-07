@@ -1,30 +1,35 @@
+use std::{
+    fmt,
+    io::{Cursor, Read, Write},
+    time::{SystemTime, UNIX_EPOCH},
+    vec,
+};
 
-
-use std::{fmt, vec, io::{Cursor, Write, Read}, time::{SystemTime, UNIX_EPOCH}};
-
+use async_trait::async_trait;
 use log::{debug, warn};
 use openssl::symm::{Cipher, Crypter};
 use plist::Data;
+use rand::Rng;
 use regex::Regex;
 use uuid::Uuid;
-use rand::Rng;
-use xml::{EventReader, reader, writer::XmlEvent, EmitterConfig};
-use async_trait::async_trait;
+use xml::{reader, writer::XmlEvent, EmitterConfig, EventReader};
 
-use crate::{apns::APNSConnection, error::PushError, util::{plist_to_bin, gzip, ungzip, decode_hex, encode_hex}, mmcs::{get_mmcs, put_mmcs, Container, PreparedPut, DataCacher, prepare_put}, mmcsp};
-
+use crate::{
+    apns::APNSConnection,
+    error::PushError,
+    mmcs::{get_mmcs, prepare_put, put_mmcs, Container, DataCacher, PreparedPut},
+    mmcsp,
+    util::{decode_hex, encode_hex, gzip, plist_to_bin, ungzip},
+};
 
 include!("./rawmessages.rs");
 
-
-const ZERO_NONCE: [u8; 16] = [
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
-];
+const ZERO_NONCE: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
 #[repr(C)]
 pub struct BalloonBody {
     pub bid: String,
-    pub data: Vec<u8>
+    pub data: Vec<u8>,
 }
 
 // conversation data, used to uniquely identify a conversation from a message
@@ -38,7 +43,7 @@ pub struct ConversationData {
 #[repr(C)]
 pub enum MessagePart {
     Text(String),
-    Attachment(Attachment)
+    Attachment(Attachment),
 }
 
 #[repr(C)]
@@ -49,18 +54,22 @@ pub struct MessageParts(pub Vec<IndexedMessagePart>);
 
 impl MessageParts {
     fn has_attachments(&self) -> bool {
-        self.0.iter().any(|p| matches!(p.0, MessagePart::Attachment(_)))
+        self.0
+            .iter()
+            .any(|p| matches!(p.0, MessagePart::Attachment(_)))
     }
 
     fn from_raw(raw: &str) -> MessageParts {
-        MessageParts(vec![IndexedMessagePart(MessagePart::Text(raw.to_string()), None)])
+        MessageParts(vec![IndexedMessagePart(
+            MessagePart::Text(raw.to_string()),
+            None,
+        )])
     }
 
     // Convert parts into xml for a RawIMessage
     fn to_xml(&self, mut raw: Option<&mut RawIMessage>) -> String {
         let mut output = vec![];
-        let mut writer_config = EmitterConfig::new()
-            .write_document_declaration(false);
+        let mut writer_config = EmitterConfig::new().write_document_declaration(false);
         writer_config.perform_escaping = false;
         let mut writer = writer_config.create_writer(Cursor::new(&mut output));
         writer.write(XmlEvent::start_element("html")).unwrap();
@@ -95,30 +104,37 @@ impl MessageParts {
                             } else {
                                 continue;
                             };
-                            writer.write(
-                                element
-                                    .attr("inline-attachment", num)
-                            ).unwrap();
+                            writer
+                                .write(element.attr("inline-attachment", num))
+                                .unwrap();
 
                             inline_attachment_num += 1;
                         }
                         AttachmentType::MMCS(mmcs) => {
-                            writer.write(
-                                element
-                                    .attr("mmcs-signature-hex", &encode_hex(&mmcs.signature))
-                                    .attr("mmcs-url", &mmcs.url)
-                                    .attr("mmcs-owner", &mmcs.object)
-                                    .attr("decryption-key", &encode_hex(&[
-                                        vec![0x00],
-                                        mmcs.key.clone()
-                                    ].concat()))
-                            ).unwrap();
+                            writer
+                                .write(
+                                    element
+                                        .attr("mmcs-signature-hex", &encode_hex(&mmcs.signature))
+                                        .attr("mmcs-url", &mmcs.url)
+                                        .attr("mmcs-owner", &mmcs.object)
+                                        .attr(
+                                            "decryption-key",
+                                            &encode_hex(&[vec![0x00], mmcs.key.clone()].concat()),
+                                        ),
+                                )
+                                .unwrap();
                         }
                     }
-                },
+                }
                 MessagePart::Text(text) => {
-                    writer.write(XmlEvent::start_element("span").attr("message-part", &part_idx)).unwrap();
-                    writer.write(XmlEvent::Characters(html_escape::encode_text(&text).as_ref())).unwrap();
+                    writer
+                        .write(XmlEvent::start_element("span").attr("message-part", &part_idx))
+                        .unwrap();
+                    writer
+                        .write(XmlEvent::Characters(
+                            html_escape::encode_text(&text).as_ref(),
+                        ))
+                        .unwrap();
                 }
             }
             writer.write(XmlEvent::end_element()).unwrap();
@@ -138,48 +154,82 @@ impl MessageParts {
         let mut text_part_idx: Option<usize> = None;
         for e in reader {
             match e {
-                Ok(reader::XmlEvent::StartElement { name, attributes, namespace: _ }) => {
+                Ok(reader::XmlEvent::StartElement {
+                    name,
+                    attributes,
+                    namespace: _,
+                }) => {
                     let get_attr = |name: &str, def: Option<&str>| {
-                        attributes.iter().find(|attr| attr.name.to_string() == name)
-                            .map_or_else(|| def.expect(&format!("attribute {} doesn't exist!", name)).to_string(), |data| data.value.to_string())
+                        attributes
+                            .iter()
+                            .find(|attr| attr.name.to_string() == name)
+                            .map_or_else(
+                                || {
+                                    def.expect(&format!("attribute {} doesn't exist!", name))
+                                        .to_string()
+                                },
+                                |data| data.value.to_string(),
+                            )
                     };
-                    let part_idx = attributes.iter().find(|attr| attr.name.to_string() == "message-part").map(|opt| opt.value.parse().unwrap());
+                    let part_idx = attributes
+                        .iter()
+                        .find(|attr| attr.name.to_string() == "message-part")
+                        .map(|opt| opt.value.parse().unwrap());
                     if name.local_name == "FILE" {
                         if string_buf.trim().len() > 0 {
-                            data.push(IndexedMessagePart(MessagePart::Text(string_buf), text_part_idx));
+                            data.push(IndexedMessagePart(
+                                MessagePart::Text(string_buf),
+                                text_part_idx,
+                            ));
                             string_buf = String::new();
                             text_part_idx = None;
                         }
-                        data.push(IndexedMessagePart(MessagePart::Attachment(Attachment {
-                            a_type: if let Some(inline) = attributes.iter().find(|attr| attr.name.to_string() == "inline-attachment") {
-                                AttachmentType::Inline(if inline.value == "ia-0" {
-                                    raw.map_or(vec![], |raw| raw.inline0.clone().unwrap().into())
-                                } else if inline.value == "ia-1" {
-                                    raw.map_or(vec![], |raw| raw.inline1.clone().unwrap().into())
+                        data.push(IndexedMessagePart(
+                            MessagePart::Attachment(Attachment {
+                                a_type: if let Some(inline) = attributes
+                                    .iter()
+                                    .find(|attr| attr.name.to_string() == "inline-attachment")
+                                {
+                                    AttachmentType::Inline(if inline.value == "ia-0" {
+                                        raw.map_or(vec![], |raw| {
+                                            raw.inline0.clone().unwrap().into()
+                                        })
+                                    } else if inline.value == "ia-1" {
+                                        raw.map_or(vec![], |raw| {
+                                            raw.inline1.clone().unwrap().into()
+                                        })
+                                    } else {
+                                        continue;
+                                    })
                                 } else {
-                                    continue
-                                })
-                            } else {
-                                let sig = decode_hex(&get_attr("mmcs-signature-hex", None)).unwrap();
-                                let key = decode_hex(&get_attr("decryption-key", None)).unwrap();
-                                AttachmentType::MMCS(MMCSFile {
-                                    signature: sig.clone(), // chop off first byte because it's not actually the signature
-                                    object: get_attr("mmcs-owner", None),
-                                    url: get_attr("mmcs-url", None),
-                                    key: key[1..].to_vec(),
-                                    size: get_attr("file-size", None).parse().unwrap()
-                                })
-                            },
-                            part: attributes.iter().find(|attr| attr.name.to_string() == "message-part").map(|item| item.value.parse().unwrap()).unwrap_or(0),
-                            uti_type: get_attr("uti-type", None),
-                            mime: get_attr("mime-type", Some("application/octet-stream")),
-                            name: get_attr("name", None),
-                            iris: get_attr("iris", Some("no")) == "yes"
-                        }), part_idx))
+                                    let sig =
+                                        decode_hex(&get_attr("mmcs-signature-hex", None)).unwrap();
+                                    let key =
+                                        decode_hex(&get_attr("decryption-key", None)).unwrap();
+                                    AttachmentType::MMCS(MMCSFile {
+                                        signature: sig.clone(), // chop off first byte because it's not actually the signature
+                                        object: get_attr("mmcs-owner", None),
+                                        url: get_attr("mmcs-url", None),
+                                        key: key[1..].to_vec(),
+                                        size: get_attr("file-size", None).parse().unwrap(),
+                                    })
+                                },
+                                part: attributes
+                                    .iter()
+                                    .find(|attr| attr.name.to_string() == "message-part")
+                                    .map(|item| item.value.parse().unwrap())
+                                    .unwrap_or(0),
+                                uti_type: get_attr("uti-type", None),
+                                mime: get_attr("mime-type", Some("application/octet-stream")),
+                                name: get_attr("name", None),
+                                iris: get_attr("iris", Some("no")) == "yes",
+                            }),
+                            part_idx,
+                        ))
                     } else if name.local_name == "span" {
                         text_part_idx = part_idx;
                     }
-                },
+                }
                 Ok(reader::XmlEvent::Characters(data)) => {
                     string_buf += &data;
                 }
@@ -187,16 +237,23 @@ impl MessageParts {
             }
         }
         if string_buf.trim().len() > 0 {
-            data.push(IndexedMessagePart(MessagePart::Text(string_buf), text_part_idx));
+            data.push(IndexedMessagePart(
+                MessagePart::Text(string_buf),
+                text_part_idx,
+            ));
         }
         MessageParts(data)
     }
 
     pub fn raw_text(&self) -> String {
-        self.0.iter().filter_map(|m| match &m.0 {
-            MessagePart::Text(text) => Some(text.clone()),
-            MessagePart::Attachment(_) => None
-        }).collect::<Vec<String>>().join("\n")
+        self.0
+            .iter()
+            .filter_map(|m| match &m.0 {
+                MessagePart::Text(text) => Some(text.clone()),
+                MessagePart::Attachment(_) => None,
+            })
+            .collect::<Vec<String>>()
+            .join("\n")
     }
 }
 
@@ -207,7 +264,7 @@ pub struct NormalMessage {
     pub body: Option<BalloonBody>,
     pub effect: Option<String>,
     pub reply_guid: Option<String>,
-    pub reply_part: Option<String>
+    pub reply_part: Option<String>,
 }
 
 impl NormalMessage {
@@ -217,20 +274,20 @@ impl NormalMessage {
             body: None,
             effect: None,
             reply_guid: None,
-            reply_part: None
+            reply_part: None,
         }
     }
 }
 
 #[repr(C)]
 pub struct RenameMessage {
-    pub new_name: String
+    pub new_name: String,
 }
 
 #[repr(C)]
 pub struct ChangeParticipantMessage {
     pub new_participants: Vec<String>,
-    pub group_version: u64
+    pub group_version: u64,
 }
 
 #[repr(C)]
@@ -240,7 +297,7 @@ pub enum Reaction {
     Dislike,
     Laugh,
     Emphsize,
-    Question
+    Question,
 }
 
 #[repr(C)]
@@ -255,7 +312,8 @@ pub struct ReactMessage {
 impl ReactMessage {
     fn get_text(&self) -> String {
         if self.enable {
-            format!("{} “{}”",
+            format!(
+                "{} “{}”",
                 match self.reaction {
                     Reaction::Heart => "Loved",
                     Reaction::Like => "Liked",
@@ -267,7 +325,8 @@ impl ReactMessage {
                 self.to_text
             )
         } else {
-            format!("Removed a{} from “{}”",
+            format!(
+                "Removed a{} from “{}”",
                 match self.reaction {
                     Reaction::Heart => " heart",
                     Reaction::Like => " like",
@@ -287,7 +346,7 @@ impl ReactMessage {
             Reaction::Dislike => 2,
             Reaction::Laugh => 3,
             Reaction::Emphsize => 4,
-            Reaction::Question => 5
+            Reaction::Question => 5,
         }
     }
 
@@ -299,7 +358,7 @@ impl ReactMessage {
             3 => Reaction::Laugh,
             4 => Reaction::Emphsize,
             5 => Reaction::Question,
-            _ => return None
+            _ => return None,
         })
     }
 }
@@ -314,7 +373,7 @@ pub struct UnsendMessage {
 pub struct EditMessage {
     pub tuuid: String,
     pub edit_part: u64,
-    pub new_parts: MessageParts
+    pub new_parts: MessageParts,
 }
 
 pub struct IMessageContainer<'a> {
@@ -322,27 +381,37 @@ pub struct IMessageContainer<'a> {
     writer: Option<&'a mut (dyn Write + Send + Sync)>,
     reader: Option<&'a mut (dyn Read + Send + Sync)>,
     cacher: DataCacher,
-    finalized: bool
+    finalized: bool,
 }
 
 impl IMessageContainer<'_> {
-    fn new<'a>(key: &[u8], writer: Option<&'a mut (dyn Write + Send + Sync)>, reader: Option<&'a mut (dyn Read + Send + Sync)>) -> IMessageContainer<'a> {
+    fn new<'a>(
+        key: &[u8],
+        writer: Option<&'a mut (dyn Write + Send + Sync)>,
+        reader: Option<&'a mut (dyn Read + Send + Sync)>,
+    ) -> IMessageContainer<'a> {
         IMessageContainer {
-            crypter: Crypter::new(Cipher::aes_256_ctr(), if writer.is_some() {
-                openssl::symm::Mode::Decrypt
-            } else {
-                openssl::symm::Mode::Encrypt
-            }, key, Some(&ZERO_NONCE)).unwrap(),
+            crypter: Crypter::new(
+                Cipher::aes_256_ctr(),
+                if writer.is_some() {
+                    openssl::symm::Mode::Decrypt
+                } else {
+                    openssl::symm::Mode::Encrypt
+                },
+                key,
+                Some(&ZERO_NONCE),
+            )
+            .unwrap(),
             writer,
             reader,
             cacher: DataCacher::new(),
-            finalized: false
+            finalized: false,
         }
     }
 
     fn finish(&mut self) -> Vec<u8> {
         if self.finalized {
-            return vec![]
+            return vec![];
         }
         self.finalized = true;
         let block_size = Cipher::aes_256_ctr().block_size();
@@ -370,8 +439,11 @@ impl<'a> Container for IMessageContainer<'a> {
             if read == 0 {
                 let ciphertext = self.finish();
                 self.cacher.data_avail(&ciphertext);
-                recieved = self.cacher.read_exact(len).or_else(|| Some(self.cacher.read_all()));
-                break
+                recieved = self
+                    .cacher
+                    .read_exact(len)
+                    .or_else(|| Some(self.cacher.read_all()));
+                break;
             } else {
                 data.resize(read, 0);
                 let block_size = Cipher::aes_256_ctr().block_size();
@@ -382,7 +454,7 @@ impl<'a> Container for IMessageContainer<'a> {
             }
             recieved = self.cacher.read_exact(len);
         }
-        
+
         Ok(recieved.unwrap_or(vec![]))
     }
     async fn write(&mut self, data: &[u8]) -> Result<(), PushError> {
@@ -411,7 +483,7 @@ pub struct MMCSFile {
     object: String,
     url: String,
     key: Vec<u8>,
-    size: usize
+    size: usize,
 }
 
 impl From<MMCSTransferData> for MMCSFile {
@@ -421,7 +493,7 @@ impl From<MMCSTransferData> for MMCSFile {
             object: value.mmcs_owner,
             url: value.mmcs_url,
             key: decode_hex(&value.decryption_key).unwrap()[1..].to_vec(),
-            size: value.file_size.parse().unwrap()
+            size: value.file_size.parse().unwrap(),
         }
     }
 }
@@ -432,30 +504,32 @@ impl Into<MMCSTransferData> for MMCSFile {
             mmcs_signature_hex: encode_hex(&self.signature).to_uppercase(),
             mmcs_owner: self.object,
             mmcs_url: self.url,
-            decryption_key: encode_hex(&[
-                vec![0x0],
-                self.key
-            ].concat()),
-            file_size: self.size.to_string()
+            decryption_key: encode_hex(&[vec![0x0], self.key].concat()),
+            file_size: self.size.to_string(),
         }
     }
 }
 
-
 impl MMCSFile {
-    pub async fn prepare_put(reader: &mut (dyn Read + Send + Sync)) -> Result<AttachmentPreparedPut, PushError> {
+    pub async fn prepare_put(
+        reader: &mut (dyn Read + Send + Sync),
+    ) -> Result<AttachmentPreparedPut, PushError> {
         let key = rand::thread_rng().gen::<[u8; 32]>();
         let mut send_container = IMessageContainer::new(&key, None, Some(reader));
         let prepared = prepare_put(&mut send_container).await?;
         Ok(AttachmentPreparedPut {
             mmcs: prepared,
-            key
+            key,
         })
     }
 
     // create and upload a new attachment to MMCS
-    pub async fn new(apns: &APNSConnection, prepared: &AttachmentPreparedPut, reader: &mut (dyn Read + Send + Sync), progress: &mut dyn FnMut(usize, usize)) -> Result<MMCSFile, PushError> {
-
+    pub async fn new(
+        apns: &APNSConnection,
+        prepared: &AttachmentPreparedPut,
+        reader: &mut (dyn Read + Send + Sync),
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<MMCSFile, PushError> {
         let mut send_container = IMessageContainer::new(&prepared.key, None, Some(reader));
         let result = put_mmcs(&mut send_container, &prepared.mmcs, apns, progress).await?;
 
@@ -466,14 +540,27 @@ impl MMCSFile {
             object: result.1,
             url,
             key: prepared.key.to_vec(),
-            size: prepared.mmcs.total_len
+            size: prepared.mmcs.total_len,
         })
     }
 
     // request to get and download attachment from MMCS
-    pub async fn get_attachment(&self, apns: &APNSConnection, writer: &mut (dyn Write + Send + Sync), progress: &mut dyn FnMut(usize, usize)) -> Result<(), PushError> {
+    pub async fn get_attachment(
+        &self,
+        apns: &APNSConnection,
+        writer: &mut (dyn Write + Send + Sync),
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<(), PushError> {
         let mut recieve_container = IMessageContainer::new(&self.key, Some(writer), None);
-        get_mmcs(&self.signature, &self.url, &self.object, apns, &mut recieve_container, progress).await?;
+        get_mmcs(
+            &self.signature,
+            &self.url,
+            &self.object,
+            apns,
+            &mut recieve_container,
+            progress,
+        )
+        .await?;
 
         Ok(())
     }
@@ -482,7 +569,7 @@ impl MMCSFile {
 #[repr(C)]
 pub enum AttachmentType {
     Inline(Vec<u8>),
-    MMCS(MMCSFile)
+    MMCS(MMCSFile),
 }
 
 #[repr(C)]
@@ -493,12 +580,19 @@ pub struct Attachment {
     uti_type: String,
     mime: String,
     name: String,
-    iris: bool // or live photo
+    iris: bool, // or live photo
 }
 
 impl Attachment {
-
-    pub async fn new_mmcs(apns: &APNSConnection, prepared: &AttachmentPreparedPut, reader: &mut (dyn Read + Send + Sync), mime: &str, uti: &str, name: &str, progress: &mut dyn FnMut(usize, usize)) -> Result<Attachment, PushError> {
+    pub async fn new_mmcs(
+        apns: &APNSConnection,
+        prepared: &AttachmentPreparedPut,
+        reader: &mut (dyn Read + Send + Sync),
+        mime: &str,
+        uti: &str,
+        name: &str,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<Attachment, PushError> {
         let mmcs = MMCSFile::new(apns, prepared, reader, progress).await?;
         Ok(Attachment {
             a_type: AttachmentType::MMCS(mmcs),
@@ -506,26 +600,29 @@ impl Attachment {
             uti_type: uti.to_string(),
             mime: mime.to_string(),
             name: name.to_string(),
-            iris: false
+            iris: false,
         })
     }
 
     pub fn get_size(&self) -> usize {
         match &self.a_type {
             AttachmentType::Inline(data) => data.len(),
-            AttachmentType::MMCS(mmcs) => mmcs.size
+            AttachmentType::MMCS(mmcs) => mmcs.size,
         }
     }
 
-    pub async fn get_attachment(&self, apns: &APNSConnection, writer: &mut (dyn Write + Send + Sync), progress: &mut dyn FnMut(usize, usize)) -> Result<(), PushError> {
+    pub async fn get_attachment(
+        &self,
+        apns: &APNSConnection,
+        writer: &mut (dyn Write + Send + Sync),
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<(), PushError> {
         match &self.a_type {
             AttachmentType::Inline(data) => {
                 writer.write_all(&data.clone())?;
                 Ok(())
-            },
-            AttachmentType::MMCS(mmcs) => {
-                mmcs.get_attachment(apns, writer, progress).await
             }
+            AttachmentType::MMCS(mmcs) => mmcs.get_attachment(apns, writer, progress).await,
         }
     }
 }
@@ -549,7 +646,7 @@ pub enum Message {
     Unsend(UnsendMessage),
     Edit(EditMessage),
     IconChange(IconChangeMessage),
-    StopTyping
+    StopTyping,
 }
 
 impl Message {
@@ -566,7 +663,7 @@ impl Message {
             Self::Edit(_) => 118,
             Self::Unsend(_) => 118,
             Self::IconChange(_) => 190,
-            Self::StopTyping => 100
+            Self::StopTyping => 100,
         }
     }
 
@@ -576,7 +673,7 @@ impl Message {
             Self::Delivered => Some(true),
             Self::Edit(_) => Some(true),
             Self::Unsend(_) => Some(true),
-            _ => None
+            _ => None,
         }
     }
 }
@@ -586,34 +683,34 @@ impl fmt::Display for Message {
         match self {
             Message::Message(msg) => {
                 write!(f, "{}", msg.parts.raw_text())
-            },
+            }
             Message::RenameMessage(msg) => {
                 write!(f, "renamed the chat to {}", msg.new_name)
-            },
+            }
             Message::ChangeParticipants(msg) => {
                 write!(f, "changed participants {:?}", msg.new_participants)
-            },
+            }
             Message::React(msg) => {
                 write!(f, "{}", msg.get_text())
-            },
+            }
             Message::Read => {
                 write!(f, "read")
-            },
+            }
             Message::Delivered => {
                 write!(f, "delivered")
-            },
+            }
             Message::Typing => {
                 write!(f, "typing")
-            },
+            }
             Message::Edit(e) => {
                 write!(f, "Edited {}", e.new_parts.raw_text())
-            },
+            }
             Message::Unsend(_e) => {
                 write!(f, "unsent a message")
-            },
+            }
             Message::IconChange(_e) => {
                 write!(f, "changed the group icon")
-            },
+            }
             Message::StopTyping => {
                 write!(f, "stopped typing")
             }
@@ -621,18 +718,25 @@ impl fmt::Display for Message {
     }
 }
 
-
 fn remove_prefix(participants: &[String]) -> Vec<String> {
-    participants.iter().map(|p| 
-        p.replace("mailto:", "").replace("tel:", "")).collect()
+    participants
+        .iter()
+        .map(|p| p.replace("mailto:", "").replace("tel:", ""))
+        .collect()
 }
 
 fn add_prefix(participants: &[String]) -> Vec<String> {
-    participants.clone().iter().map(|p| if p.contains("@") {
-        format!("mailto:{}", p)
-    } else {
-        format!("tel:{}", p)
-    }).collect()
+    participants
+        .clone()
+        .iter()
+        .map(|p| {
+            if p.contains("@") {
+                format!("mailto:{}", p)
+            } else {
+                format!("tel:{}", p)
+            }
+        })
+        .collect()
 }
 
 // a message that can be sent to other iMessage users
@@ -643,7 +747,7 @@ pub struct IMessage {
     pub after_guid: Option<String>,
     pub conversation: Option<ConversationData>,
     pub message: Message,
-    pub sent_timestamp: u64
+    pub sent_timestamp: u64,
 }
 
 impl IMessage {
@@ -652,8 +756,13 @@ impl IMessage {
         if conversation.sender_guid.is_none() {
             conversation.sender_guid = Some(Uuid::new_v4().to_string());
         }
-        if !conversation.participants.contains(self.sender.as_ref().unwrap()) {
-            conversation.participants.push(self.sender.as_ref().unwrap().clone());
+        if !conversation
+            .participants
+            .contains(self.sender.as_ref().unwrap())
+        {
+            conversation
+                .participants
+                .push(self.sender.as_ref().unwrap().clone());
         }
     }
 
@@ -662,7 +771,7 @@ impl IMessage {
             Message::Read => false,
             Message::Delivered => false,
             Message::Typing => false,
-            _ => true
+            _ => true,
         }
     }
 
@@ -670,7 +779,7 @@ impl IMessage {
         match &self.message {
             Message::Typing => Some(0),
             Message::StopTyping => Some(0),
-            _ => None
+            _ => None,
         }
     }
 
@@ -686,10 +795,10 @@ impl IMessage {
                     new_name: msg.new_name.clone(),
                     old_name: conversation.cv_name.clone(),
                     name: msg.new_name.clone(),
-                    msg_type: "n".to_string()
+                    msg_type: "n".to_string(),
                 };
                 plist_to_bin(&raw).unwrap()
-            },
+            }
             Message::StopTyping => {
                 let raw = RawIMessage {
                     text: None,
@@ -707,9 +816,9 @@ impl IMessage {
                     reply: None,
                     inline0: None,
                     inline1: None,
-                    live_xml: None
+                    live_xml: None,
                 };
-        
+
                 plist_to_bin(&raw).unwrap()
             }
             Message::ChangeParticipants(msg) => {
@@ -721,10 +830,10 @@ impl IMessage {
                     new_name: conversation.cv_name.clone().unwrap(),
                     name: conversation.cv_name.clone().unwrap(),
                     msg_type: "p".to_string(),
-                    group_version: msg.group_version
+                    group_version: msg.group_version,
                 };
                 plist_to_bin(&raw).unwrap()
-            },
+            }
             Message::React(react) => {
                 let amt = if react.enable {
                     react.get_idx() + 2000
@@ -746,13 +855,15 @@ impl IMessage {
                     cv_name: conversation.cv_name.clone(),
                     msi: plist_to_bin(&MsiData {
                         ams: "test".to_string(),
-                        amc: 1
-                    }).unwrap().into(),
-                    amk: format!("p:{}/{}", react.to_part, react.to_uuid)
+                        amc: 1,
+                    })
+                    .unwrap()
+                    .into(),
+                    amk: format!("p:{}/{}", react.to_part, react.to_uuid),
                 };
                 plist_to_bin(&raw).unwrap()
-            },
-            Message::Message (normal) => {
+            }
+            Message::Message(normal) => {
                 let mut raw = RawIMessage {
                     text: Some(normal.parts.raw_text()),
                     xml: None,
@@ -766,20 +877,23 @@ impl IMessage {
                     b: None,
                     effect: normal.effect.clone(),
                     cv_name: conversation.cv_name.clone(),
-                    reply: normal.reply_guid.as_ref().map(|guid| format!("r:{}:{}", normal.reply_part.as_ref().unwrap(), guid)),
+                    reply: normal
+                        .reply_guid
+                        .as_ref()
+                        .map(|guid| format!("r:{}:{}", normal.reply_part.as_ref().unwrap(), guid)),
                     inline0: None,
                     inline1: None,
-                    live_xml: None
+                    live_xml: None,
                 };
 
                 if normal.parts.has_attachments() {
                     raw.xml = Some(normal.parts.to_xml(Some(&mut raw)));
                 }
-                
+
                 should_gzip = !raw.xml.is_some();
-        
+
                 plist_to_bin(&raw).unwrap()
-            },
+            }
             Message::Delivered => panic!("no enc body!"),
             Message::Read => panic!("no enc body!"),
             Message::Typing => panic!("no enc body!"),
@@ -792,18 +906,18 @@ impl IMessage {
                     v: "1".to_string(),
                 };
                 plist_to_bin(&raw).unwrap()
-            },
+            }
             Message::Edit(msg) => {
                 let raw = RawEditMessage {
                     new_html_body: msg.new_parts.to_xml(None),
                     et: 1,
                     part_index: msg.edit_part,
                     message: msg.tuuid.clone(),
-                    new_text: msg.new_parts.raw_text()
+                    new_text: msg.new_parts.raw_text(),
                 };
 
                 plist_to_bin(&raw).unwrap()
-            },
+            }
             Message::IconChange(msg) => {
                 let start = SystemTime::now();
                 let since_the_epoch = start
@@ -817,22 +931,28 @@ impl IMessage {
                         filename_key: "GroupPhotoImage".to_string(),
                         local_user_info: file.clone().into(),
                         transfer_guid: format!("at_0_{}", random_guid),
-                        message_guid: random_guid.clone()
+                        message_guid: random_guid.clone(),
                     }),
                     sender_guid: conversation.sender_guid.clone(),
                     msg_type: "v".to_string(),
                     participants: remove_prefix(&conversation.participants),
                     gv: "8".to_string(),
-                    cv_name: conversation.cv_name.clone()
+                    cv_name: conversation.cv_name.clone(),
                 };
 
-                warn!("sent {:?}", plist::Value::from_reader(Cursor::new(&plist_to_bin(&raw).unwrap())));
+                warn!(
+                    "sent {:?}",
+                    plist::Value::from_reader(Cursor::new(&plist_to_bin(&raw).unwrap()))
+                );
 
                 plist_to_bin(&raw).unwrap()
             }
         };
-        debug!("sending: {:?}", plist::Value::from_reader(Cursor::new(&binary)));
-        
+        debug!(
+            "sending: {:?}",
+            plist::Value::from_reader(Cursor::new(&binary))
+        );
+
         // do not gzip xml
         let final_msg = if !should_gzip {
             binary
@@ -845,72 +965,94 @@ impl IMessage {
 
     pub(super) fn from_raw(bytes: &[u8], wrapper: &RecvMsg) -> Option<IMessage> {
         let decompressed = ungzip(&bytes).unwrap_or_else(|_| bytes.to_vec());
-        debug!("xml: {:?}", plist::Value::from_reader(Cursor::new(&decompressed)));
+        debug!(
+            "xml: {:?}",
+            plist::Value::from_reader(Cursor::new(&decompressed))
+        );
         if let Ok(loaded) = plist::from_bytes::<RawUnsendMessage>(&decompressed) {
             let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
             return Some(IMessage {
                 sender: Some(wrapper.sender.clone()),
-                id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
+                id: Uuid::from_bytes(msg_guid.try_into().unwrap())
+                    .to_string()
+                    .to_uppercase(),
                 after_guid: None,
                 sent_timestamp: wrapper.sent_timestamp / 1000000,
                 conversation: None,
-                message: Message::Unsend(UnsendMessage { tuuid: loaded.message, edit_part: loaded.part_index }),
-            })
+                message: Message::Unsend(UnsendMessage {
+                    tuuid: loaded.message,
+                    edit_part: loaded.part_index,
+                }),
+            });
         }
         if let Ok(loaded) = plist::from_bytes::<RawEditMessage>(&decompressed) {
             let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
             return Some(IMessage {
                 sender: Some(wrapper.sender.clone()),
-                id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
+                id: Uuid::from_bytes(msg_guid.try_into().unwrap())
+                    .to_string()
+                    .to_uppercase(),
                 after_guid: None,
                 sent_timestamp: wrapper.sent_timestamp / 1000000,
                 conversation: None,
                 message: Message::Edit(EditMessage {
                     tuuid: loaded.message,
                     edit_part: loaded.part_index,
-                    new_parts: MessageParts::parse_parts(&loaded.new_html_body, None)
+                    new_parts: MessageParts::parse_parts(&loaded.new_html_body, None),
                 }),
-            })
+            });
         }
         if let Ok(loaded) = plist::from_bytes::<RawChangeMessage>(&decompressed) {
             let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
             return Some(IMessage {
                 sender: Some(wrapper.sender.clone()),
-                id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
+                id: Uuid::from_bytes(msg_guid.try_into().unwrap())
+                    .to_string()
+                    .to_uppercase(),
                 after_guid: None,
                 sent_timestamp: wrapper.sent_timestamp / 1000000,
                 conversation: Some(ConversationData {
                     participants: add_prefix(&loaded.source_participants),
                     cv_name: Some(loaded.name.clone()),
-                    sender_guid: loaded.sender_guid.clone()
+                    sender_guid: loaded.sender_guid.clone(),
                 }),
-                message: Message::ChangeParticipants(ChangeParticipantMessage { new_participants: add_prefix(&loaded.target_participants), group_version: loaded.group_version }),
-            })
+                message: Message::ChangeParticipants(ChangeParticipantMessage {
+                    new_participants: add_prefix(&loaded.target_participants),
+                    group_version: loaded.group_version,
+                }),
+            });
         }
         if let Ok(loaded) = plist::from_bytes::<RawIconChangeMessage>(&decompressed) {
-            warn!("recieved {:?}", plist::Value::from_reader(Cursor::new(&decompressed)));
+            warn!(
+                "recieved {:?}",
+                plist::Value::from_reader(Cursor::new(&decompressed))
+            );
             let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
             return Some(IMessage {
                 sender: Some(wrapper.sender.clone()),
-                id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
+                id: Uuid::from_bytes(msg_guid.try_into().unwrap())
+                    .to_string()
+                    .to_uppercase(),
                 after_guid: None,
                 sent_timestamp: wrapper.sent_timestamp / 1000000,
                 conversation: Some(ConversationData {
                     participants: add_prefix(&loaded.participants),
                     cv_name: loaded.cv_name.clone(),
-                    sender_guid: loaded.sender_guid.clone()
+                    sender_guid: loaded.sender_guid.clone(),
                 }),
                 message: Message::IconChange(IconChangeMessage {
                     file: loaded.new_icon.map(|icon| icon.local_user_info.into()),
-                    group_version: loaded.group_version
+                    group_version: loaded.group_version,
                 }),
-            })
+            });
         }
         if let Ok(loaded) = plist::from_bytes::<RawRenameMessage>(&decompressed) {
             let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
             return Some(IMessage {
                 sender: Some(wrapper.sender.clone()),
-                id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
+                id: Uuid::from_bytes(msg_guid.try_into().unwrap())
+                    .to_string()
+                    .to_uppercase(),
                 after_guid: None,
                 sent_timestamp: wrapper.sent_timestamp / 1000000,
                 conversation: Some(ConversationData {
@@ -918,13 +1060,17 @@ impl IMessage {
                     cv_name: loaded.old_name.clone(),
                     sender_guid: loaded.sender_guid.clone(),
                 }),
-                message: Message::RenameMessage(RenameMessage { new_name: loaded.new_name.clone() }),
-            })
+                message: Message::RenameMessage(RenameMessage {
+                    new_name: loaded.new_name.clone(),
+                }),
+            });
         }
         if let Ok(loaded) = plist::from_bytes::<RawReactMessage>(&decompressed) {
             let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
-            let target_msg_data = Regex::new(r"p:([0-9]+)/([0-9A-F\-]+)").unwrap()
-                .captures(&loaded.amk).unwrap();
+            let target_msg_data = Regex::new(r"p:([0-9]+)/([0-9A-F\-]+)")
+                .unwrap()
+                .captures(&loaded.amk)
+                .unwrap();
             let enabled = loaded.amt < 3000;
             let id = if enabled {
                 loaded.amt - 2000
@@ -933,7 +1079,9 @@ impl IMessage {
             };
             return Some(IMessage {
                 sender: Some(wrapper.sender.clone()),
-                id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
+                id: Uuid::from_bytes(msg_guid.try_into().unwrap())
+                    .to_string()
+                    .to_uppercase(),
                 after_guid: loaded.after_guid.clone(),
                 sent_timestamp: wrapper.sent_timestamp / 1000000,
                 conversation: Some(ConversationData {
@@ -946,9 +1094,9 @@ impl IMessage {
                     to_part: target_msg_data.get(1).unwrap().as_str().parse().unwrap(),
                     to_text: "".to_string(),
                     enable: enabled,
-                    reaction: ReactMessage::from_idx(id)?
+                    reaction: ReactMessage::from_idx(id)?,
                 }),
-            })
+            });
         }
         if let Ok(loaded) = plist::from_bytes::<RawIMessage>(&decompressed) {
             let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
@@ -960,14 +1108,24 @@ impl IMessage {
                 parts.remove(guididx);
                 (guid, parts.join(":"))
             });
-            let parts = loaded.live_xml.as_ref().or(loaded.xml.as_ref()).map_or_else(|| {
-                loaded.text.as_ref().map_or(MessageParts(vec![]), |text| MessageParts::from_raw(text))
-            }, |xml| {
-                MessageParts::parse_parts(xml, Some(&loaded))
-            });
+            let parts = loaded
+                .live_xml
+                .as_ref()
+                .or(loaded.xml.as_ref())
+                .map_or_else(
+                    || {
+                        loaded
+                            .text
+                            .as_ref()
+                            .map_or(MessageParts(vec![]), |text| MessageParts::from_raw(text))
+                    },
+                    |xml| MessageParts::parse_parts(xml, Some(&loaded)),
+                );
             return Some(IMessage {
                 sender: Some(wrapper.sender.clone()),
-                id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
+                id: Uuid::from_bytes(msg_guid.try_into().unwrap())
+                    .to_string()
+                    .to_uppercase(),
                 after_guid: loaded.after_guid.clone(),
                 sent_timestamp: wrapper.sent_timestamp / 1000000,
                 conversation: Some(ConversationData {
@@ -978,15 +1136,22 @@ impl IMessage {
                 message: Message::Message(NormalMessage {
                     parts,
                     body: if let Some(body) = &loaded.b {
-                            if let Some(bid) = &loaded.bid {
-                                Some(BalloonBody { bid: bid.clone(), data: body.clone().into() })
-                            } else { None }
-                        } else { None },
+                        if let Some(bid) = &loaded.bid {
+                            Some(BalloonBody {
+                                bid: bid.clone(),
+                                data: body.clone().into(),
+                            })
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    },
                     effect: loaded.effect.clone(),
                     reply_guid: replies.as_ref().map(|r| r.0.clone()),
                     reply_part: replies.as_ref().map(|r| r.1.clone()),
                 }),
-            })
+            });
         }
         None
     }
@@ -994,6 +1159,11 @@ impl IMessage {
 
 impl fmt::Display for IMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{}] '{}'", self.sender.clone().unwrap_or("unknown".to_string()), self.message)
+        write!(
+            f,
+            "[{}] '{}'",
+            self.sender.clone().unwrap_or("unknown".to_string()),
+            self.message
+        )
     }
 }

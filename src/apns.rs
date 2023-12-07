@@ -1,24 +1,44 @@
 use std::{io, sync::Arc, time::Duration};
 
-use log::{debug, warn, info};
-use openssl::{sha::{Sha1, sha1}, pkey::PKey, hash::MessageDigest, sign::Signer, rsa::Padding, x509::X509};
+use async_recursion::async_recursion;
+use log::{debug, info, warn};
+use openssl::{
+    hash::MessageDigest,
+    pkey::PKey,
+    rsa::Padding,
+    sha::{sha1, Sha1},
+    sign::Signer,
+    x509::X509,
+};
 use plist::Value;
-use rustls::Certificate;
-use tokio::{net::TcpStream, io::{WriteHalf, ReadHalf, AsyncReadExt, AsyncWriteExt}, sync::{Mutex, oneshot, mpsc::{self, Receiver}}};
-use tokio_rustls::{TlsConnector, client::TlsStream};
 use rand::Rng;
+use rustls::Certificate;
+use serde::{Deserialize, Serialize};
 use std::net::ToSocketAddrs;
 use tokio::io::split;
-use serde::{Serialize, Deserialize};
-use async_recursion::async_recursion;
 use tokio::time::interval;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
+    net::TcpStream,
+    sync::{
+        mpsc::{self, Receiver},
+        oneshot, Mutex,
+    },
+};
+use tokio_rustls::{client::TlsStream, TlsConnector};
 
-use crate::{albert::generate_push_cert, bags::{get_bag, APNS_BAG}, util::KeyPair, ids::signing::generate_nonce, PushError};
+use crate::{
+    albert::generate_push_cert,
+    bags::{get_bag, APNS_BAG},
+    ids::signing::generate_nonce,
+    util::KeyPair,
+    PushError,
+};
 
 #[derive(Debug, Clone)]
 pub struct APNSPayload {
     pub id: u8,
-    pub fields: Vec<(u8, Vec<u8>)>
+    pub fields: Vec<(u8, Vec<u8>)>,
 }
 
 impl APNSPayload {
@@ -26,7 +46,9 @@ impl APNSPayload {
         APNSPayload { id, fields }
     }
 
-    async fn read(read: &mut ReadHalf<TlsStream<TcpStream>>) -> Result<Option<APNSPayload>, PushError> {
+    async fn read(
+        read: &mut ReadHalf<TlsStream<TcpStream>>,
+    ) -> Result<Option<APNSPayload>, PushError> {
         let id = read.read_u8().await?;
 
         if id == 0x0 {
@@ -42,15 +64,12 @@ impl APNSPayload {
         while curr_buf.len() > 0 {
             let fid = curr_buf[0];
             let flen = u16::from_be_bytes(curr_buf[1..3].try_into().unwrap()) as usize;
-            let fval = &curr_buf[3..3+flen];
+            let fval = &curr_buf[3..3 + flen];
             fields.push((fid, fval.to_vec()));
-            curr_buf = &curr_buf[3+flen..];
+            curr_buf = &curr_buf[3 + flen..];
         }
 
-        Ok(Some(APNSPayload {
-            id,
-            fields
-        }))
+        Ok(Some(APNSPayload { id, fields }))
     }
 
     pub fn get_field(&self, field: u8) -> Option<&Vec<u8>> {
@@ -58,16 +77,30 @@ impl APNSPayload {
     }
 
     fn serialize(&self) -> Vec<u8> {
-        let payload: Vec<u8> = self.fields.iter().flat_map(|(id, val)| {
-            [id.to_be_bytes().to_vec(), (val.len() as u16).to_be_bytes().to_vec(), val.clone()].concat()
-        }).collect();
-        [self.id.to_be_bytes().to_vec(), (payload.len() as u32).to_be_bytes().to_vec(), payload].concat()
+        let payload: Vec<u8> = self
+            .fields
+            .iter()
+            .flat_map(|(id, val)| {
+                [
+                    id.to_be_bytes().to_vec(),
+                    (val.len() as u16).to_be_bytes().to_vec(),
+                    val.clone(),
+                ]
+                .concat()
+            })
+            .collect();
+        [
+            self.id.to_be_bytes().to_vec(),
+            (payload.len() as u32).to_be_bytes().to_vec(),
+            payload,
+        ]
+        .concat()
     }
 }
 
 struct InnerSubmitter {
     stream: WriteHalf<TlsStream<TcpStream>>,
-    token: Vec<u8>
+    token: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -75,7 +108,13 @@ pub struct APNSSubmitter(Arc<Mutex<InnerSubmitter>>, Option<APNSReader>);
 
 impl APNSSubmitter {
     fn make(stream: WriteHalf<TlsStream<TcpStream>>) -> APNSSubmitter {
-        APNSSubmitter(Arc::new(Mutex::new(InnerSubmitter { stream, token: vec![] })), None)
+        APNSSubmitter(
+            Arc::new(Mutex::new(InnerSubmitter {
+                stream,
+                token: vec![],
+            })),
+            None,
+        )
     }
 
     async fn token(&self) -> Vec<u8> {
@@ -96,26 +135,43 @@ impl APNSSubmitter {
 
     async fn send_payload(&self, id: u8, fields: Vec<(u8, Vec<u8>)>) -> Result<(), PushError> {
         //debug!("Sending payload {}: {:?}", id, fields);
-        self.write_data(&APNSPayload::new(id, fields).serialize()).await?;
+        self.write_data(&APNSPayload::new(id, fields).serialize())
+            .await?;
         Ok(())
     }
 
     pub async fn set_state(&self, state: u8) -> Result<(), PushError> {
         debug!("Sending state packet {}", state);
         let magic_num: u32 = 0x7FFFFFFF;
-        self.send_payload(0x14, vec![(1, state.to_be_bytes().to_vec()), (2, magic_num.to_be_bytes().to_vec())]).await?;
+        self.send_payload(
+            0x14,
+            vec![
+                (1, state.to_be_bytes().to_vec()),
+                (2, magic_num.to_be_bytes().to_vec()),
+            ],
+        )
+        .await?;
         Ok(())
     }
 
-    async fn send_message(&self, topic: &str, payload: &[u8], id: Option<&[u8]>) -> Result<(), PushError> {
+    async fn send_message(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        id: Option<&[u8]>,
+    ) -> Result<(), PushError> {
         let rand = rand::thread_rng().gen::<[u8; 4]>();
         let id = id.unwrap_or(&rand);
-        self.send_payload(0x0A, vec![
-            (4, id.to_vec()),
-            (1, sha1(topic.as_bytes()).to_vec()),
-            (2, self.token().await),
-            (3, payload.to_vec())
-        ]).await?;
+        self.send_payload(
+            0x0A,
+            vec![
+                (4, id.to_vec()),
+                (1, sha1(topic.as_bytes()).to_vec()),
+                (2, self.token().await),
+                (3, payload.to_vec()),
+            ],
+        )
+        .await?;
         Ok(())
     }
 
@@ -127,10 +183,14 @@ impl APNSSubmitter {
 
     async fn send_ack(&self, id: &[u8]) -> Result<(), PushError> {
         debug!("Sending ack for {:?}", id);
-        self.send_payload(0x0B, vec![(1, self.token().await), (4, id.to_vec()), (8, vec![0x0])]).await?;
+        self.send_payload(
+            0x0B,
+            vec![(1, self.token().await), (4, id.to_vec()), (8, vec![0x0])],
+        )
+        .await?;
         Ok(())
     }
-    
+
     pub async fn filter(&self, topics: &[&str]) -> Result<(), PushError> {
         debug!("Sending filter for {:?}", topics);
         let mut fields = vec![(1, self.token().await)];
@@ -146,7 +206,7 @@ impl APNSSubmitter {
 
 enum WaitingCb {
     OneShot(oneshot::Sender<APNSPayload>),
-    Cont(mpsc::Sender<APNSPayload>)
+    Cont(mpsc::Sender<APNSPayload>),
 }
 
 struct WaitingTask {
@@ -185,34 +245,41 @@ impl APNSReader {
         self.read_connection(read, write, state).await;
     }
 
-    async fn read_connection(self, mut read: ReadHalf<TlsStream<TcpStream>>, write: APNSSubmitter, state: APNSState) {
+    async fn read_connection(
+        self,
+        mut read: ReadHalf<TlsStream<TcpStream>>,
+        write: APNSSubmitter,
+        state: APNSState,
+    ) {
         loop {
             let result = APNSPayload::read(&mut read).await;
             let Ok(payload) = result else {
                 warn!("conn broken? {:?}", result);
                 drop(read);
                 self.reload_connection(write, state, 0).await;
-                break // maybe conn broken?
+                break; // maybe conn broken?
             };
-            let Some(payload) = payload else {
-                continue
-            };
+            let Some(payload) = payload else { continue };
             if payload.id == 0x0A {
                 debug!("Sending automatic ACK");
                 if let Err(_) = write.send_ack(payload.get_field(4).unwrap()).await {
-                    break // conn broken?
+                    break; // conn broken?
                 }
             }
-            
+
             //debug!("Recieved payload {:?}", payload);
             let mut locked = self.0.lock().await;
-            let remove_idxs: Vec<usize> = locked.iter().enumerate().filter_map(|(i, item)| {
-                if (item.waiting_for)(&payload) {
-                    Some(i)
-                } else {
-                    None
-                }
-            }).collect();
+            let remove_idxs: Vec<usize> = locked
+                .iter()
+                .enumerate()
+                .filter_map(|(i, item)| {
+                    if (item.waiting_for)(&payload) {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
             for idx in remove_idxs.iter().rev() {
                 match &locked.get(*idx).unwrap().when {
                     WaitingCb::OneShot(_cb) => {
@@ -220,7 +287,7 @@ impl APNSReader {
                             panic!("no")
                         };
                         cb.send(payload.clone()).unwrap();
-                    },
+                    }
                     WaitingCb::Cont(cb) => {
                         cb.send(payload.clone()).await.unwrap();
                     }
@@ -229,7 +296,11 @@ impl APNSReader {
         }
     }
 
-    fn new(read: ReadHalf<TlsStream<TcpStream>>, write: APNSSubmitter, state: APNSState) -> APNSReader {
+    fn new(
+        read: ReadHalf<TlsStream<TcpStream>>,
+        write: APNSSubmitter,
+        state: APNSState,
+    ) -> APNSReader {
         let reader = APNSReader(Arc::new(Mutex::new(vec![])));
         let reader_clone = reader.clone();
         tokio::spawn(async move {
@@ -244,7 +315,10 @@ impl APNSReader {
     {
         let mut locked = self.0.lock().await;
         let (tx, rx) = mpsc::channel(20);
-        locked.push(WaitingTask { waiting_for: Box::new(p), when: WaitingCb::Cont(tx) });
+        locked.push(WaitingTask {
+            waiting_for: Box::new(p),
+            when: WaitingCb::Cont(tx),
+        });
         rx
     }
 
@@ -254,14 +328,15 @@ impl APNSReader {
     {
         self.wait_find_pred(move |x| {
             if x.id != 0x0A {
-                return false
+                return false;
             }
             let Some(body) = x.get_field(3) else {
-                return false
+                return false;
             };
             let loaded: Value = plist::from_bytes(body).unwrap();
             p(&loaded)
-        }).await
+        })
+        .await
     }
 
     pub async fn wait_find_pred<F>(&self, p: F) -> APNSPayload
@@ -270,7 +345,10 @@ impl APNSReader {
     {
         let mut locked = self.0.lock().await;
         let (tx, rx) = oneshot::channel();
-        locked.push(WaitingTask { waiting_for: Box::new(p), when: WaitingCb::OneShot(tx) });
+        locked.push(WaitingTask {
+            waiting_for: Box::new(p),
+            when: WaitingCb::OneShot(tx),
+        });
         drop(locked);
         rx.await.unwrap()
     }
@@ -283,21 +361,23 @@ impl APNSReader {
 pub struct APNSConnection {
     pub submitter: APNSSubmitter,
     pub state: APNSState,
-    pub reader: APNSReader
+    pub reader: APNSReader,
 }
 
 // serialize this to JSON to save state
 #[derive(Serialize, Deserialize, Clone)]
 pub struct APNSState {
     pub keypair: KeyPair,
-    pub token: Option<Vec<u8>>
+    pub token: Option<Vec<u8>>,
 }
 
 const APNS_PORT: u16 = 5223;
 
 impl APNSConnection {
     async fn connect() -> Result<TlsStream<TcpStream>, PushError> {
-        let x509 = X509::from_pem(include_bytes!("../certs/root/profileidentity.ess.apple.com.cert"))?;
+        let x509 = X509::from_pem(include_bytes!(
+            "../certs/root/profileidentity.ess.apple.com.cert"
+        ))?;
         let certificate = Certificate(x509.to_der()?);
 
         let mut root_store = rustls::RootCertStore::empty();
@@ -312,15 +392,28 @@ impl APNSConnection {
         let connector = TlsConnector::from(Arc::new(config));
 
         let bag = get_bag(APNS_BAG).await?;
-        let host = format!("{}-{}", 
-            rand::thread_rng().gen_range(1..bag.get("APNSCourierHostcount").unwrap().as_unsigned_integer().unwrap()),
-            bag.get("APNSCourierHostname").unwrap().as_string().unwrap());
-        let addr = (host.as_str(), APNS_PORT).to_socket_addrs()?.next().ok_or(io::Error::from(io::ErrorKind::NotFound))?;
+        let host = format!(
+            "{}-{}",
+            rand::thread_rng().gen_range(
+                1..bag
+                    .get("APNSCourierHostcount")
+                    .unwrap()
+                    .as_unsigned_integer()
+                    .unwrap()
+            ),
+            bag.get("APNSCourierHostname").unwrap().as_string().unwrap()
+        );
+        let addr = (host.as_str(), APNS_PORT)
+            .to_socket_addrs()?
+            .next()
+            .ok_or(io::Error::from(io::ErrorKind::NotFound))?;
         let stream = TcpStream::connect(&addr).await?;
 
-        let domain = rustls::ServerName::try_from(bag.get("APNSCourierHostname").unwrap().as_string().unwrap())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid dnsname"))?;
-        
+        let domain = rustls::ServerName::try_from(
+            bag.get("APNSCourierHostname").unwrap().as_string().unwrap(),
+        )
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid dnsname"))?;
+
         let connection = connector.connect(domain, stream).await?;
 
         info!("Connected to APNs ({})", host);
@@ -328,7 +421,12 @@ impl APNSConnection {
         Ok(connection)
     }
 
-    pub async fn send_message(&self, topic: &str, payload: &[u8], id: Option<&[u8]>) -> Result<(), PushError> {
+    pub async fn send_message(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        id: Option<&[u8]>,
+    ) -> Result<(), PushError> {
         self.submitter.send_message(topic, payload, id).await?;
         let msg = self.reader.wait_find(0x0B).await;
         if msg.get_field(8).unwrap()[0] != 0x0 {
@@ -337,7 +435,11 @@ impl APNSConnection {
         Ok(())
     }
 
-    async fn init_conn(submitter: &APNSSubmitter, reader: &APNSReader, state: &mut APNSState) -> Result<(), PushError> {
+    async fn init_conn(
+        submitter: &APNSSubmitter,
+        reader: &APNSReader,
+        state: &mut APNSState,
+    ) -> Result<(), PushError> {
         // connect
         let flags: u32 = 0b01000001;
 
@@ -346,17 +448,14 @@ impl APNSConnection {
         let mut signer = Signer::new(MessageDigest::sha1(), priv_key.as_ref())?;
         signer.set_rsa_padding(Padding::PKCS1)?;
         let nonce = generate_nonce(0x0);
-        let signature = [
-            vec![0x1, 0x1],
-            signer.sign_oneshot_to_vec(&nonce)?
-        ].concat();
+        let signature = [vec![0x1, 0x1], signer.sign_oneshot_to_vec(&nonce)?].concat();
 
         let mut fields = vec![
             (0x2, vec![0x01]),
             (0x5, flags.to_be_bytes().to_vec()),
             (0xC, state.keypair.cert.clone()),
             (0xD, nonce),
-            (0xE, signature)
+            (0xE, signature),
         ];
 
         if let Some(token) = &state.token {
@@ -365,14 +464,14 @@ impl APNSConnection {
         } else {
             debug!("Sending connect message without token");
         }
-        
+
         submitter.send_payload(7, fields).await?;
 
         let response = reader.wait_find(8).await;
         if u8::from_be_bytes(response.get_field(1).unwrap().clone().try_into().unwrap()) != 0x00 {
-            return Err(PushError::APNSConnectError)
+            return Err(PushError::APNSConnectError);
         }
-        
+
         let new_token = response.get_field(3);
         let token = if let Some(new_token) = new_token {
             state.token = Some(new_token.clone());
@@ -408,7 +507,7 @@ impl APNSConnection {
                 let keypair = generate_push_cert().await?;
                 APNSState {
                     keypair,
-                    token: None
+                    token: None,
                 }
             }
         };
@@ -422,7 +521,7 @@ impl APNSConnection {
         let conn: APNSConnection = APNSConnection {
             reader,
             submitter: writer.clone(),
-            state
+            state,
         };
         Ok(conn)
     }

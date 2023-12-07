@@ -2,19 +2,28 @@ use std::io::Cursor;
 use std::num::ParseIntError;
 
 use base64::engine::general_purpose;
-use libflate::gzip::{HeaderBuilder, EncodeOptions, Encoder, Decoder};
-use plist::{Error, Value};
 use base64::Engine;
-use reqwest::{Client, Certificate};
-use serde::{Serialize, Deserialize};
-use std::io::{Write, Read};
+use libflate::gzip::{Decoder, EncodeOptions, Encoder, HeaderBuilder};
+use plist::{Error, Value};
+use reqwest::{Certificate, Client};
+use serde::{Deserialize, Serialize};
 use std::fmt::Write as FmtWrite;
+use std::io::{Read, Write};
 
 pub fn make_reqwest() -> Client {
     let certificates = vec![
-        Certificate::from_pem(include_bytes!("../certs/root/albert.apple.com.digicert.cert")).unwrap(),
-        Certificate::from_pem(include_bytes!("../certs/root/profileidentity.ess.apple.com.cert")).unwrap(),
-        Certificate::from_pem(include_bytes!("../certs/root/init-p01st.push.apple.com.cert")).unwrap(),
+        Certificate::from_pem(include_bytes!(
+            "../certs/root/albert.apple.com.digicert.cert"
+        ))
+        .unwrap(),
+        Certificate::from_pem(include_bytes!(
+            "../certs/root/profileidentity.ess.apple.com.cert"
+        ))
+        .unwrap(),
+        Certificate::from_pem(include_bytes!(
+            "../certs/root/init-p01st.push.apple.com.cert"
+        ))
+        .unwrap(),
         Certificate::from_pem(include_bytes!("../certs/root/init.ess.apple.com.cert")).unwrap(),
         Certificate::from_pem(include_bytes!("../certs/root/content-icloud-com.cert")).unwrap(),
     ];
@@ -27,10 +36,10 @@ pub fn make_reqwest() -> Client {
     }
 
     /*let builder = reqwest::Client::builder()
-        .use_rustls_tls()
-        .proxy(Proxy::https("https://localhost:8080").unwrap())
-        .danger_accept_invalid_certs(true);*/
-    
+    .use_rustls_tls()
+    .proxy(Proxy::https("https://localhost:8080").unwrap())
+    .danger_accept_invalid_certs(true);*/
+
     builder.build().unwrap()
 }
 
@@ -46,7 +55,7 @@ pub fn get_nested_value<'s>(val: &'s Value, path: &[&str]) -> Option<&'s Value> 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct KeyPair {
     pub cert: Vec<u8>,
-    pub private: Vec<u8>
+    pub private: Vec<u8>,
 }
 
 pub fn base64_encode(data: &[u8]) -> String {

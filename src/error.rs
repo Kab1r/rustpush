@@ -1,6 +1,6 @@
-use std::{io, fmt::Display};
+use std::{fmt::Display, io};
 
-use openssl::{error::ErrorStack, aes::KeyError};
+use openssl::{aes::KeyError, error::ErrorStack};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -19,7 +19,7 @@ pub enum PushError {
     APNSConnectError,
     TLSError(rustls::Error),
     StatusError(reqwest::StatusCode /* code */),
-    AlbertCertParseError
+    AlbertCertParseError,
 }
 
 impl Display for PushError {
